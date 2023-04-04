@@ -26,12 +26,15 @@ from PIL import Image
 import string
 # from gtts import gTTS
 # import pygame
+import winsound
 from ctypes import wintypes
 import ctypes
 import comtypes
 import re
 from pystray import MenuItem as item
 from threading import Thread
+from XInput import *
+import wmi
 def get_resource_path(relative_path):
     try:
         # PyInstaller creates a temp folder and stores path in _MEIPASS
@@ -39,6 +42,10 @@ def get_resource_path(relative_path):
     except Exception:
         base_path = os.path.abspath(".")
     return os.path.join(base_path, relative_path)
+def is_voicemeeter():
+    default_output_device_index = pa.get_default_output_device_info()['index']
+    name = pa.get_device_info_by_index(default_output_device_index)['name'].lower()
+    return ("virtual" in name) or ("vb-audio" in name)
 MMDeviceApiLib = comtypes.GUID(
     '{2FDAAFA3-7523-4F66-9957-9D5E7FE698F6}')
 IID_IMMDevice = comtypes.GUID(
@@ -53,7 +60,9 @@ CLSID_MMDeviceEnumerator = comtypes.GUID(
     '{BCDE0395-E52F-467C-8E3D-C4579291692E}')
 eRender = 0
 keyboard=Controller()
+from pycaw.pycaw import AudioUtilities, ISimpleAudioVolume
 # ERole
+c=wmi.WMI()
 eConsole = 0 # games, system sounds, and voice commands
 eMultimedia = 1 # music, movies, narration
 eCommunications = 2 # voice communications
@@ -63,6 +72,21 @@ LPDWORD = ctypes.POINTER(wintypes.DWORD)
 LPUINT = ctypes.POINTER(wintypes.UINT)
 LPBOOL = ctypes.POINTER(wintypes.BOOL)
 PIUnknown = ctypes.POINTER(comtypes.IUnknown)
+xinput = ctypes.windll.xinput1_4
+
+# Define the XINPUT_GAMEPAD structure
+class XINPUT_GAMEPAD(ctypes.Structure):
+    _fields_ = [("wButtons", ctypes.c_ushort)]
+
+# Define the XINPUT_STATE structure
+class XINPUT_STATE(ctypes.Structure):
+    _fields_ = [("dwPacketNumber", ctypes.c_ulong),
+                ("Gamepad", XINPUT_GAMEPAD)]
+
+# Define the XInputGetState function
+XInputGetState = xinput.XInputGetState
+XInputGetState.argtypes = [ctypes.c_uint, ctypes.POINTER(XINPUT_STATE)]
+XInputGetState.restype = ctypes.c_uint
 class IMMDevice(comtypes.IUnknown):
     _iid_ = IID_IMMDevice
     _methods_ = (
@@ -170,6 +194,12 @@ statusLabel=Label(win, text='')
 statusLabel.pack()
 win.withdraw()
 win.iconbitmap(get_resource_path('mic.ico'))
+for s in c.Win32_ComputerSystem():
+    if 'Microsoft' in s.Manufacturer and 'Virtual' in s.Model:
+        win.is_vm=True
+        break
+else:
+    win.is_vm=False
 try:
     key=QueryValueEx(OpenKey(OpenKey(OpenKey(HKEY_CURRENT_USER, 'Software', reserved=0, access=KEY_ALL_ACCESS), 'sserver', reserved=0, access=KEY_ALL_ACCESS), 'OpenAI Virtual Assistant', reserved=0, access=KEY_ALL_ACCESS), 'Key')[0]
     if key!='':
@@ -223,10 +253,13 @@ stream = pa.open(
 
 # Initialize recording
 frames = []
-
-
+def play_start_tone():
+    winsound.Beep(880, 250)
+def play_end_tone():
+    winsound.Beep(440, 250)
 def record_audio():
     global listening, stream_open, stream
+    Thread(target=play_start_tone, daemon=True).start()
     if not stream_open:
         stream_open=True
         stream = pa.open(
@@ -241,7 +274,7 @@ def record_audio():
     win.deiconify()
     statusLabel.config(text='Listening...')
     is_speaking = False
-    start_time = time.time()
+    start_record_time = time.time()
     while True:
         # Read audio data from the microphone
         pcm = stream.read(porcupine.frame_length)
@@ -256,7 +289,7 @@ def record_audio():
             is_speaking = False
 
         # Check for recording timeout
-        elapsed_time = time.time() - start_time
+        elapsed_time = time.time() - start_record_time
         if elapsed_time >= MAX_RECORD_SECONDS:
             frames.append(pcm)
             print('Recording timeout reached.')
@@ -266,6 +299,7 @@ def record_audio():
             print('Silence detected.')
             break
     listening=False
+    Thread(target=play_end_tone, daemon=True).start()
     if os.path.exists(WAVE_OUTPUT_FILENAME):
         os.remove(WAVE_OUTPUT_FILENAME)
     wf = wave.open(WAVE_OUTPUT_FILENAME, 'wb')
@@ -353,7 +387,7 @@ def toggle_listen():
 listening_enabled=True
 def main():
     while True:
-        global stream, listening_enabled, stream_open
+        global stream, listening_enabled, stream_open, start_time
         if stream_open:
             pcm = stream.read(porcupine.frame_length)
             pcm = struct.unpack_from("h" * porcupine.frame_length, pcm)
@@ -362,12 +396,22 @@ def main():
             result = porcupine.process(pcm)
         else:
             result=-1
-        if result == 0:
+        if get_connected()[0]:
+            if get_button_values(get_state(0))['BACK']:
+                if time.time()-start_time>=2:
+                    homeHeld=True
+                else:
+                    homeHeld=False
+            else:
+                homeHeld=False
+                start_time=time.time()
+        if result == 0 or homeHeld:
+            homeHeld=False
             record_audio()
             try:
                 text = transcribe_audio()
             except openai.error.APIConnectionError:
-                synthesize_and_play_audio_fallback("I can't connect to the internet right now. Please check your Wi-Fi settings.")
+                synthesize_and_play_audio_fallback("I can't reach the internet right now. Please check your network connection.")
             else:
                 text=text.lower()
                 anymatch=False
@@ -381,42 +425,57 @@ def main():
                     match = re.match("^volume (\d+)(%|)$", text)
                     if match:
                         anymatch=True
-                        val=int(match.group(1))
-                        val=max(0, min(val, 100))
-                        ev = IAudioEndpointVolume.get_default()
-                        ev.SetMasterVolumeLevelScalar(val/100)
-                        if val==100:
-                            synthesize_and_play_audio("OK. This is as loud as it gets.")
-                        elif val==0:
-                            synthesize_and_play_audio("OK. This is as quiet as it gets.")
+                        if win.is_vm:
+                            synthesize_and_play_audio("Sorry, precise volume control is not supported inside a virtual machine. Please use your host operating system’s volume control instead.")
+                        elif is_voicemeeter():
+                            synthesize_and_play_audio("Sorry, precise volume control is not supported for virtual audio devices. Please adjust the volume of your speakers using its own volume control.")
                         else:
-                            synthesize_and_play_audio("Media volume set to {} percent.".format(round(val)))
+                            val=int(match.group(1))
+                            val=max(0, min(val, 100))
+                            ev = IAudioEndpointVolume.get_default()
+                            ev.SetMasterVolumeLevelScalar(val/100)
+                            if val==100:
+                                synthesize_and_play_audio("OK. This is as loud as it gets.")
+                            elif val==0:
+                                synthesize_and_play_audio("OK. This is as quiet as it gets.")
+                            else:
+                                synthesize_and_play_audio("Media volume set to {} percent.".format(round(val)))
                     match = re.match("^set volume to (\d+) percent$", text)
                     if match:
                         anymatch=True
-                        val=int(match.group(1))
-                        val=max(0, min(val, 100))
-                        ev = IAudioEndpointVolume.get_default()
-                        ev.SetMasterVolumeLevelScalar(val/100)
-                        if val==100:
-                            synthesize_and_play_audio("OK. This is as loud as it gets.")
-                        elif val==0:
-                            synthesize_and_play_audio("OK. This is as quiet as it gets.")
+                        if win.is_vm:
+                            synthesize_and_play_audio("Sorry, precise volume control is not supported inside a virtual machine. Please use your host operating system’s volume control instead.")
+                        elif is_voicemeeter():
+                            synthesize_and_play_audio("Sorry, precise volume control is not supported for virtual audio devices. Please adjust the volume of your speakers using its own volume control.")
                         else:
-                            synthesize_and_play_audio("Media volume set to {} percent.".format(round(val)))
+                            val=int(match.group(1))
+                            val=max(0, min(val, 100))
+                            ev = IAudioEndpointVolume.get_default()
+                            ev.SetMasterVolumeLevelScalar(val/100)
+                            if val==100:
+                                synthesize_and_play_audio("OK. This is as loud as it gets.")
+                            elif val==0:
+                                synthesize_and_play_audio("OK. This is as quiet as it gets.")
+                            else:
+                                synthesize_and_play_audio("Media volume set to {} percent.".format(round(val)))
                     match = re.match("^set volume to (\d+)$", text)
                     if match:
                         anymatch=True
-                        val=int(match.group(1))
-                        val=max(0, min(val, 100))
-                        ev = IAudioEndpointVolume.get_default()
-                        ev.SetMasterVolumeLevelScalar(val/100)
-                        if val==100:
-                            synthesize_and_play_audio("OK. This is as loud as it gets.")
-                        elif val==0:
-                            synthesize_and_play_audio("OK. This is as quiet as it gets.")
+                        if win.is_vm:
+                            synthesize_and_play_audio("Sorry, precise volume control is not supported inside a virtual machine. Please use your host operating system’s volume control instead.")
+                        elif is_voicemeeter():
+                            synthesize_and_play_audio("Sorry, precise volume control is not supported for virtual audio devices. Please adjust the volume of your speakers using its own volume control.")
                         else:
-                            synthesize_and_play_audio("Media volume set to {} percent.".format(round(val)))
+                            val=int(match.group(1))
+                            val=max(0, min(val, 100))
+                            ev = IAudioEndpointVolume.get_default()
+                            ev.SetMasterVolumeLevelScalar(val/100)
+                            if val==100:
+                                synthesize_and_play_audio("OK. This is as loud as it gets.")
+                            elif val==0:
+                                synthesize_and_play_audio("OK. This is as quiet as it gets.")
+                            else:
+                                synthesize_and_play_audio("Media volume set to {} percent.".format(round(val)))
                     if text == 'volume up' or text=='raise the volume' or text=='make it louder' or text=='crank it up' or text=='increase the volume':
                         keyboard.press(Key.media_volume_up)
                         keyboard.release(Key.media_volume_up)
@@ -429,13 +488,22 @@ def main():
                         keyboard.press(Key.media_volume_mute)
                         keyboard.release(Key.media_volume_mute)
                         synthesize_and_play_audio("OK.")
+                    elif text=='what is the current volume' or text=='what is the volume' or text=='get current volume' or text=='get volume':
+                        if win.is_vm:
+                            synthesize_and_play_audio("Sorry, the current volume cannot be determined inside a virtual machine.")
+                        elif is_voicemeeter():
+                            synthesize_and_play_audio("Sorry, the current volume cannot be determined for virtual audio devices.")
+                        else:
+                            ev = IAudioEndpointVolume.get_default()
+                            current_vol=round(ev.GetMasterVolumeLevelScalar()*100)
+                            synthesize_and_play_audio(f"The current volume is {current_vol} percent.")
                     elif text=='power off' or text=='shut down' or text=='shut down the computer' or text=='shut down the device' or text=='power off the computer' or text=='power off the device' or text=='turn off the computer' or text=='turn off the device':
                         synthesize_and_play_audio("Are you sure you want to turn the computer off?")
                         record_audio()
                         try:
                             text = transcribe_audio()
                         except openai.error.APIConnectionError:
-                            synthesize_and_play_audio_fallback("I can't connect to the internet right now. Please check your Wi-Fi settings.")
+                            synthesize_and_play_audio("Hmm... something went wrong. Try again in a few seconds.")
                         else:
                             text=text.lower()
                             try:
@@ -454,7 +522,7 @@ def main():
                         try:
                             text = transcribe_audio()
                         except openai.error.APIConnectionError:
-                            synthesize_and_play_audio_fallback("I can't connect to the internet right now. Please check your Wi-Fi settings.")
+                            synthesize_and_play_audio("Hmm... something went wrong. Try again in a few seconds.")
                         else:
                             text=text.lower()
                             try:
@@ -481,6 +549,8 @@ def main():
                             synthesize_and_play_audio(response_text)
 
                     # Re-initialize PyAudio
+            start_time=time.time()
+            homeHeld=False
             if listening_enabled:
                 stream = pa.open(
                     rate=porcupine.sample_rate,
@@ -503,10 +573,10 @@ def close():
     sys.exit()
 listening=False
 stream_open=True
+start_time=time.time()
 image = Image.open(get_resource_path('mic.ico'))
 menu = (item('Listen for "Computer"', toggle_listen, checked=lambda item: listening_enabled), item('Exit', close))
 icon = pystray.Icon("name", image, "OpenAI Virtual Assistant (c) sserver", menu)
 Thread(target=icon.run, daemon=True).start()
 Thread(target=main, daemon=True).start()
 win.mainloop()
-
