@@ -19,7 +19,6 @@ import os
 from tkinter import simpledialog
 from tkinter import *
 from pynput.keyboard import Key, Controller
-# Load environment variables from the .env file
 import pyttsx3
 from winreg import *
 from PIL import Image
@@ -72,21 +71,6 @@ LPDWORD = ctypes.POINTER(wintypes.DWORD)
 LPUINT = ctypes.POINTER(wintypes.UINT)
 LPBOOL = ctypes.POINTER(wintypes.BOOL)
 PIUnknown = ctypes.POINTER(comtypes.IUnknown)
-xinput = ctypes.windll.xinput1_4
-
-# Define the XINPUT_GAMEPAD structure
-class XINPUT_GAMEPAD(ctypes.Structure):
-    _fields_ = [("wButtons", ctypes.c_ushort)]
-
-# Define the XINPUT_STATE structure
-class XINPUT_STATE(ctypes.Structure):
-    _fields_ = [("dwPacketNumber", ctypes.c_ulong),
-                ("Gamepad", XINPUT_GAMEPAD)]
-
-# Define the XInputGetState function
-XInputGetState = xinput.XInputGetState
-XInputGetState.argtypes = [ctypes.c_uint, ctypes.POINTER(XINPUT_STATE)]
-XInputGetState.restype = ctypes.c_uint
 class IMMDevice(comtypes.IUnknown):
     _iid_ = IID_IMMDevice
     _methods_ = (
