@@ -265,7 +265,6 @@ CreateKeyEx(
     "sserver\OpenAI Virtual Assistant",
     reserved=0,
 )
-PICOVOICE_API_KEY = os.environ.get("PICOVOICE_API_KEY")
 win = Tk()
 win.overrideredirect(True)
 win.attributes("-topmost", True)
